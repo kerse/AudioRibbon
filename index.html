@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Visual Lab — Multi‑Viz + Mic (secure)</title>
+  <style>
+    :root{
+      --bg:#08090c; --text:#e0e0e0; --muted:#a0a0a0; --panel:rgba(25,28,36,.8);
+      --ctl:rgba(0,0,0,.3); --accent:#4f8dff; --accent-2:#7fd1ff; --danger:#b13b3b;
+    }
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,Arial,Helvetica,sans-serif;overflow:hidden}
+    #canvas{display:block;width:100vw;height:100vh}
+
+    /* Top bar */
+    .topbar{position:absolute;top:.75rem;left:50%;transform:translateX(-50%);display:flex;gap:.4rem;background:var(--panel);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.1);border-radius:999px;padding:.35rem .5rem;box-shadow:0 8px 32px rgba(0,0,0,.3)}
+    .viz-btn{border:0;border-radius:999px;padding:.45rem .7rem;background:#1b202a;color:#d8e3ff;font-weight:700;letter-spacing:.2px;cursor:pointer}
+    .viz-btn:hover{background:#263043}
+    .viz-btn.active{background:var(--accent);color:white}
+
+    /* Side panel */
+    .panel{position:absolute;right:1rem;top:1rem;background:var(--panel);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:1rem;min-width:280px;max-width:360px;box-shadow:0 8px 32px rgba(0,0,0,.3)}
+    .panel h2{margin:.1rem 0 .6rem;font-size:1rem}
+    .row{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.6rem}
+    .btn{border:0;border-radius:10px;padding:.5rem .85rem;font-weight:700;cursor:pointer}
+    .btn.primary{background:var(--accent);color:white}
+    .btn.primary:disabled{background:#47506c;cursor:not-allowed}
+    .btn.ghost{background:transparent;border:1px solid rgba(255,255,255,.15);color:#e6e6e6}
+    .btn.danger{background:var(--danger);color:white}
+    .status{font-size:.85rem;color:var(--muted);background:var(--ctl);padding:.45rem .55rem;border-radius:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:.6rem}
+
+    .group{display:grid;grid-template-columns:120px 1fr;gap:.5rem 1rem;align-items:center;margin:.35rem 0}
+    .group label{font-size:.88rem;font-weight:700}
+    input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:6px;background:var(--ctl);border-radius:3px}
+    input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;background:var(--accent);border-radius:50%;cursor:pointer}
+    input[type=range]::-moz-range-thumb{width:16px;height:16px;background:var(--accent);border-radius:50%;cursor:pointer}
+
+    .small{font-size:.78rem;color:#cfd3dc}
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <!-- Visualization picker -->
+  <div class="topbar" id="vizBar"></div>
+
+  <!-- Controls -->
+  <div class="panel">
+    <h2 id="vizTitle">Ribbon / Ink</h2>
+    <div class="row">
+      <button id="btnStart" class="btn primary">Start Mic</button>
+      <button id="btnStop" class="btn ghost" disabled>Stop</button>
+      <button id="btnReset" class="btn danger">Reset</button>
+    </div>
+    <div id="status" class="status">Idle</div>
+
+    <!-- Generic controls (apply to most modes). Keep compact. -->
+    <div class="group"><label for="ctlThickness">Thickness</label><input type="range" id="ctlThickness" min="1" max="20" step="0.5" value="6"></div>
+    <div class="group"><label for="ctlWaviness">Waviness</label><input type="range" id="ctlWaviness" min="0" max="2" step="0.1" value="1.2"></div>
+    <div class="group"><label for="ctlHue">Hue Base</label><input type="range" id="ctlHue" min="0" max="360" step="1" value="190"></div>
+    <div class="group"><label for="ctlTrail">Motion Trail</label><input type="range" id="ctlTrail" min="0.02" max="0.5" step="0.01" value="0.12"></div>
+
+    <!-- Per‑mode placeholder section (we can extend later) -->
+    <div class="small" id="modeHint">Mode‑specific parameters will appear here if needed.</div>
+
+    <!-- Diagnostics hidden per request (kept in code for future) -->
+  </div>
+
+  <script>
+    // ====== Core state ======
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const btnStart = document.getElementById('btnStart');
+    const btnStop  = document.getElementById('btnStop');
+    const btnReset = document.getElementById('btnReset');
+
+    const ctlThickness = document.getElementById('ctlThickness');
+    const ctlWaviness  = document.getElementById('ctlWaviness');
+    const ctlHue       = document.getElementById('ctlHue');
+    const ctlTrail     = document.getElementById('ctlTrail');
+
+    const VIZ_MODES = [
+      { id:'orb',      title:'Spherical Orb' },
+      { id:'petals',   title:'Origami Petals' },
+      { id:'metaball', title:'Liquid Metaballs' },
+      { id:'ribbon',   title:'Ribbon / Ink' },
+      { id:'beams',    title:'Radial Beams' },
+      { id:'star',     title:'Crystal Star' },
+    ];
+
+    const state = {
+      t0: performance.now(), w: 800, h: 600, points: [],
+      controls: { baseWidth:6, waviness:1.2, hue:190, trail:0.12 },
+      // audio
+      ac: null, analyser:null, micStream:null, micSource:null, isLive:false,
+      // features
+      feat: { env:0.05, centroid:0.3, flatness:0.2, pitch:140, vad:false, tempo:2.0 },
+      // tempo detector
+      lastEnv:0, lastPeakT:0, intervals:[],
+      // viz
+      mode:'ribbon',
+      hueShift:0,
+      metaballs:[],
+      petalsPulse:0,
+    };
+
+    // Build topbar buttons
+    const vizBar = document.getElementById('vizBar');
+    const vizTitle = document.getElementById('vizTitle');
+    VIZ_MODES.forEach(m => {
+      const b = document.createElement('button');
+      b.className = 'viz-btn'; b.textContent = m.title; b.dataset.viz = m.id;
+      b.addEventListener('click', () => setMode(m.id));
+      vizBar.appendChild(b);
+    });
+    function setMode(id){
+      state.mode = id; vizTitle.textContent = VIZ_MODES.find(v=>v.id===id)?.title || id;
+      [...vizBar.querySelectorAll('.viz-btn')].forEach(btn => btn.classList.toggle('active', btn.dataset.viz===id));
+      // soft reset visuals for new mode
+      state.points.length = 0; state.metaballs.length = 0; state.petalsPulse = 0; state.hueShift = 0;
+    }
+    setMode('ribbon'); // default
+
+    // Canvas size
+    function onResize(){
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      canvas.width = Math.floor(canvas.clientWidth * dpr);
+      canvas.height= Math.floor(canvas.clientHeight * dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      state.w = canvas.clientWidth; state.h = canvas.clientHeight;
+    }
+    addEventListener('resize', onResize); onResize();
+
+    // ====== Audio setup ======
+    function isSecure(){ if (isSecureContext) return true; const h=location.hostname; return h==='localhost'||h==='127.0.0.1'||h==='::1'; }
+    function setStatus(s){ statusEl.textContent = s; }
+
+    function initAudio(){ if (state.ac) return; const AC = window.AudioContext||window.webkitAudioContext; state.ac = new AC(); state.analyser = state.ac.createAnalyser(); state.analyser.fftSize = 1024; }
+
+    async function startMic(){
+      try{
+        if(!isSecure()) throw new DOMException('Use HTTPS or localhost for mic.', 'SecurityError');
+        initAudio(); await state.ac.resume?.();
+        const stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true } });
+        const src = state.ac.createMediaStreamSource(stream); src.connect(state.analyser);
+        state.micStream = stream; state.micSource = src; state.isLive = true; setStatus('Mic live');
+        btnStart.disabled = true; btnStop.disabled = false;
+      }catch(e){
+        const n = e?.name||'Error';
+        if(n==='NotAllowedError'||n==='PermissionDeniedError') setStatus('Allow microphone for this site and try again.');
+        else if(n==='SecurityError') setStatus('Secure context required (HTTPS/localhost).');
+        else if(n==='NotFoundError') setStatus('No microphone found.');
+        else if(n==='NotReadableError') setStatus('Microphone busy in another app.');
+        else setStatus('Mic start failed: '+n);
+      }
+    }
+    function stopMic(){
+      if(!state.isLive) return; try{ state.micSource?.disconnect(); }catch{}
+      if(state.micStream){ for(const t of state.micStream.getTracks()) t.stop(); }
+      state.micStream=null; state.micSource=null; state.isLive=false; btnStart.disabled=false; btnStop.disabled=true; setStatus('Stopped');
+    }
+
+    btnStart.addEventListener('click', startMic);
+    btnStop.addEventListener('click', stopMic);
+    btnReset.addEventListener('click', ()=>{ stopMic(); state.points.length=0; state.metaballs.length=0; state.petalsPulse=0; setStatus('Idle'); });
+
+    // Control bindings
+    ctlThickness.addEventListener('input', e=> state.controls.baseWidth = +e.target.value);
+    ctlWaviness .addEventListener('input', e=> state.controls.waviness  = +e.target.value);
+    ctlHue      .addEventListener('input', e=> state.controls.hue       = +e.target.value);
+    ctlTrail    .addEventListener('input', e=> state.controls.trail     = +e.target.value);
+
+    // ====== Feature extraction ======
+    const td = new Float32Array(1024);
+    const fd = new Uint8Array(512);
+
+    function stepFeatures(now){
+      if(!(state.isLive && state.analyser)) return decayFeatures();
+      const an = state.analyser; const sr = state.ac.sampleRate||48000;
+      // time domain
+      if (an.getFloatTimeDomainData) an.getFloatTimeDomainData(td); else { const b = new Uint8Array(td.length); an.getByteTimeDomainData(b); for(let i=0;i<td.length;i++) td[i]= (b[i]-128)/128; }
+      // RMS env
+      let sum=0; for(let i=0;i<td.length;i++){ const v=td[i]; sum+=v*v; }
+      let env = Math.sqrt(sum/td.length); env = clamp(env*4.0, 0, 1);
+      // spectrum
+      an.getByteFrequencyData(fd);
+      let wsum=0, ssum=0; for(let i=0;i<fd.length;i++){ wsum += i*fd[i]; ssum += fd[i]; }
+      const centroid = ssum>0 ? (wsum/ssum)/(fd.length*0.25) : 0; // ~0..1
+      const bright = clamp(centroid,0,1);
+      // spectral flatness (geometric mean / arithmetic mean)
+      let gm=0, am=0, n=fd.length; for(let i=0;i<n;i++){ const x = Math.max(1e-3, fd[i]/255); gm += Math.log(x); am += x; }
+      gm = Math.exp(gm/n); am/=n; let flat = clamp(gm/Math.max(1e-6,am), 0, 1);
+      // crude pitch via autocorrelation
+      const pitch = estimatePitchAC(td, sr) || lerp(80,320,bright);
+      // VAD
+      const vad = env > 0.06;
+      // tempo by envelope peak detection
+      const t = now*0.001; const rising = env>0.09 && state.lastEnv<=0.09 && env>state.lastEnv; // edge
+      if(rising){ if(state.lastPeakT>0){ state.intervals.push(t-state.lastPeakT); if(state.intervals.length>8) state.intervals.shift(); } state.lastPeakT=t; }
+      const med = median(state.intervals); const tempo = med>0 ? 1/med : 0; // Hz
+      state.lastEnv = env;
+
+      // smooth
+      const s=0.18;
+      state.feat.env      = lerp(state.feat.env, env, s);
+      state.feat.centroid = lerp(state.feat.centroid, bright, s);
+      state.feat.flatness = lerp(state.feat.flatness, flat, s);
+      state.feat.pitch    = lerp(state.feat.pitch, pitch, s);
+      state.feat.vad      = vad;
+      state.feat.tempo    = lerp(state.feat.tempo, tempo, .15);
+    }
+    function decayFeatures(){ // gentle idle breathing
+      const t = (performance.now()-state.t0)/1000; const base = 0.04 + 0.02*Math.sin(t*0.7);
+      state.feat.env = lerp(state.feat.env, base, 0.05);
+      state.feat.centroid = lerp(state.feat.centroid, 0.25+0.05*Math.sin(t*0.3), 0.03);
+      state.feat.flatness = lerp(state.feat.flatness, 0.2, 0.02);
+      state.feat.pitch = lerp(state.feat.pitch, 140+10*Math.sin(t*0.5), 0.02);
+      state.feat.vad = false; state.feat.tempo = lerp(state.feat.tempo, 1.2, 0.02);
+    }
+
+    function estimatePitchAC(buf, sr){
+      // Simple ACF: search 80..320 Hz
+      const minF=80, maxF=320; const minLag=Math.floor(sr/maxF), maxLag=Math.floor(sr/minF);
+      let bestLag=-1, bestCorr=0;
+      for(let lag=minLag; lag<=maxLag; lag++){
+        let corr=0, n=buf.length-lag; for(let i=0;i<n;i++){ corr += buf[i]*buf[i+lag]; }
+        corr/=n; if(corr>bestCorr){ bestCorr=corr; bestLag=lag; }
+      }
+      if(bestLag>0 && bestCorr>0.01) return sr/bestLag; return null;
+    }
+
+    // ====== Rendering loop ======
+    function render(now){
+      stepFeatures(now);
+      const { env, centroid, flatness, pitch, vad, tempo } = state.feat;
+      const hueBase = (state.controls.hue + mapPitchHue(pitch))%360;
+
+      // clear with trail
+      ctx.save(); ctx.globalCompositeOperation='source-over';
+      ctx.fillStyle = `rgba(8,9,12, ${clamp(state.controls.trail, .02, .35)})`;
+      ctx.fillRect(0,0,state.w,state.h); ctx.restore();
+
+      switch(state.mode){
+        case 'orb':    drawOrb(hueBase, env, centroid, flatness, pitch, vad); break;
+        case 'petals': drawPetals(hueBase, env, centroid, flatness, pitch, tempo); break;
+        case 'metaball': drawMetaballs(hueBase, env, centroid, flatness, pitch, vad); break;
+        case 'beams':  drawBeams(hueBase, env, centroid, flatness, pitch, tempo); break;
+        case 'star':   drawStar(hueBase, env, centroid, flatness, pitch, vad); break;
+        case 'ribbon':
+        default:       drawRibbon(hueBase, env, centroid, pitch); break;
+      }
+      requestAnimationFrame(render);
+    }
+    requestAnimationFrame(render);
+
+    // ====== Viz: helpers common ======
+    function mapPitchHue(p){ return clamp((p-80)/(320-80),0,1)*140; }
+    function center(){ return { x:state.w*0.5, y:state.h*0.5 }; }
+    function lerp(a,b,t){ return a+(b-a)*t }
+    function clamp(x,a,b){ return Math.max(a, Math.min(b, x)) }
+    function smoothstep(a,b,t){ const x=clamp((t-a)/(b-a),0,1); return x*x*(3-2*x) }
+    function noise2(x,y){ const s=Math.sin(x*12.9898+y*78.233)*43758.5453; return (s-Math.floor(s))*2-1 }
+    function median(arr){ if(!arr.length) return 0; const s=[...arr].sort((a,b)=>a-b); const m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2 }
+
+    // ====== Viz: Ribbon / Ink (existing, adapted to mic) ======
+    function drawRibbon(hue, env, bright, pitch){
+      const pts = state.points; const {w,h} = state; const c=center();
+      const r = Math.min(w,h)*(0.22 + 0.08*bright);
+      const t = (performance.now()-state.t0)/1000; const ang = t*(0.6 + 0.4 * clamp((pitch-80)/(320-80),0,1));
+      const target = { x:c.x + r*Math.cos(ang) + noise2(t*.8,0)*40*(.3+bright), y:c.y + r*Math.sin(ang) + noise2(0,t*.7)*40*(.3+bright)};
+      if(pts.length===0){ for(let i=0;i<80;i++) pts.push({x:target.x,y:target.y}); }
+      const speed = 0.2 + 0.35*env; pts[0].x += (target.x-pts[0].x)*(0.12 + speed*0.08); pts[0].y += (target.y-pts[0].y)*(0.12 + speed*0.08);
+      for(let i=1;i<pts.length;i++){ const p=pts[i], q=pts[i-1]; p.x += (q.x-p.x)*(0.16+0.05*env); p.y += (q.y-p.y)*(0.16+0.05*env); }
+
+      const baseW = state.controls.baseWidth * (0.6 + 2.6*smoothstep(0,1,env));
+      const sat = 75 + 20*bright; const light = 50 + 15*env;
+      const left=[], right=[]; const wav = (0.2 + 1.0*bright) * state.controls.waviness;
+      for(let i=0;i<pts.length;i++){
+        const p=pts[i], q=pts[Math.min(i+1,pts.length-1)]; let dx=q.x-p.x, dy=q.y-p.y; const L=Math.hypot(dx,dy)||1; dx/=L; dy/=L; const nx=-dy, ny=dx; const t01=i/(pts.length-1);
+        const twist=Math.sin((t*2.2+t01*10)+clamp((pitch-80)/(320-80),0,1)*4)*wav; const wv=baseW*(0.25+0.75*(1-t01))*(1+0.25*twist);
+        left.push({x:p.x+nx*wv,y:p.y+ny*wv}); right.push({x:p.x-nx*wv,y:p.y-ny*wv});
+      }
+      // glow
+      ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.fillStyle=`hsla(${hue},${sat}%,${light+15}%,${0.08+0.08*env})`;
+      pathFill(left,right); ctx.restore();
+      // gradient body
+      const g=ctx.createLinearGradient(pts[0].x,pts[0].y,pts[pts.length-1].x,pts[pts.length-1].y);
+      const ladj = light + 10 - 6*smoothstep(0.7,1.0,env); g.addColorStop(0,`hsla(${hue},${sat}%,${ladj}%,0.95)`); g.addColorStop(1,`hsla(${(hue+40)%360},${sat-10}%,${ladj-5}%,0.85)`);
+      ctx.save(); ctx.globalCompositeOperation='screen'; ctx.fillStyle=g; pathFill(left,right); ctx.restore();
+      // edges
+      ctx.lineWidth=1.2; ctx.strokeStyle=`hsla(${(hue+60)%360},85%,90%,${0.35+0.35*env})`; ctx.beginPath(); pathStroke(left); ctx.stroke(); ctx.beginPath(); pathStroke(right); ctx.stroke();
+    }
+    function pathStroke(arr){ if(arr.length<2) return; ctx.moveTo(arr[0].x,arr[0].y); for(let i=1;i<arr.length-1;i++){ const p=arr[i],n=arr[i+1]; const cx=(p.x+n.x)*.5, cy=(p.y+n.y)*.5; ctx.quadraticCurveTo(p.x,p.y,cx,cy);} const last=arr[arr.length-1]; ctx.lineTo(last.x,last.y); }
+    function pathFill(left,right){ ctx.beginPath(); pathStroke(left); pathStroke([...right].reverse()); ctx.closePath(); ctx.fill(); }
+
+    // ====== Viz: Orb ======
+    function drawOrb(hue, env, bright, flat, pitch, vad){
+      const c=center(); const baseR = Math.min(state.w,state.h)*0.18; const r = baseR * (1 + 0.6*env);
+      const grad = ctx.createRadialGradient(c.x,c.y, r*0.15, c.x,c.y,r);
+      grad.addColorStop(0, `hsla(${(hue+10)%360},70%,${vad?70:58}%, ${vad?0.7:0.5})`);
+      grad.addColorStop(1, `hsla(${(hue+190)%360},30%,10%, 0.05)`);
+
+      // outer soft-glass sphere
+      ctx.save(); ctx.globalCompositeOperation='screen'; ctx.fillStyle=grad; circle(c.x,c.y,r); ctx.fill();
+      // inner ribbons (3 chords), curvature by centroid
+      const bends = 0.6 + bright*1.8; const sat = 70+20*bright; const t=(performance.now()-state.t0)/1000;
+      for(let k=0;k<3;k++){
+        const a = t*0.7 + k*2.1; const col = `hsla(${(hue + k*30)%360}, ${sat}%, ${55+10*env}%, ${0.35+0.25*env})`;
+        ctx.strokeStyle=col; ctx.lineWidth=1.2+env*2; ctx.beginPath();
+        for(let i=0;i<=64;i++){
+          const u=i/64; const ang = u*Math.PI*2; const rr = r*0.75 + Math.sin(ang*bends + a)*r*0.06; const x=c.x+rr*Math.cos(ang), y=c.y+rr*Math.sin(ang);
+          if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        }
+        ctx.stroke();
+      }
+      // graininess by flatness (approx.)
+      const dots = Math.floor(80*flat); ctx.globalAlpha=0.08+0.12*flat; for(let i=0;i<dots;i++){ const rr=r*(0.2+Math.random()*0.8); const ang=Math.random()*Math.PI*2; ctx.fillStyle=`hsla(${hue},60%,70%,.6)`; circle(c.x+rr*Math.cos(ang), c.y+rr*Math.sin(ang), 0.8); ctx.fill(); }
+      ctx.restore();
+    }
+
+    // ====== Viz: Petals ======
+    function drawPetals(hue, env, centroid, flat, pitch, tempo){
+      const c=center(); const petals = 5; const baseR = Math.min(state.w,state.h)*0.12; const rotSpeed = (0.3 + tempo*0.2);
+      const t=(performance.now()-state.t0)/1000; const rot = t*rotSpeed;
+      // pulse on syllables
+      if (state.feat.vad && env>0.12 && state.lastEnv<=0.12) state.petalsPulse = 1.0;
+      state.petalsPulse = lerp(state.petalsPulse, 0, 0.12);
+
+      for(let i=0;i<petals;i++){
+        const ang = rot + i*(Math.PI*2/petals);
+        const len = baseR*(1.2 + 0.6*clamp((pitch-120)/160,0,1)); // high pitch -> longer
+        const thick = 12 + 28*centroid; // centroid -> thickness
+        const open = 0.65 + 0.35*env + 0.25*state.petalsPulse; // syllable click
+        petal(c.x, c.y, ang, len, thick*open, hue + i*18, env);
+      }
+    }
+    function petal(cx,cy,ang,len,thick,hue,env){
+      const ox=Math.cos(ang), oy=Math.sin(ang); const nx=-oy, ny=ox; const tipx=cx+ox*len, tipy=cy+oy*len;
+      const w=thick; const c1x=cx+ox*(len*0.45)+nx*w, c1y=cy+oy*(len*0.45)+ny*w; const c2x=cx+ox*(len*0.75)-nx*w, c2y=cy+oy*(len*0.75)-ny*w;
+      ctx.save(); ctx.globalCompositeOperation='screen'; ctx.fillStyle=`hsla(${hue%360},70%,${50+20*env}%,${0.35+0.25*env})`;
+      ctx.beginPath(); ctx.moveTo(cx+nx*w*0.6, cy+ny*w*0.6); ctx.quadraticCurveTo(c1x,c1y, tipx,tipy); ctx.quadraticCurveTo(c2x,c2y, cx-nx*w*0.6, cy-ny*w*0.6); ctx.closePath(); ctx.fill(); ctx.restore();
+    }
+
+    // ====== Viz: Metaballs ======
+    function drawMetaballs(hue, env, centroid, flat, pitch, vad){
+      if(state.metaballs.length===0){
+        const n=4; const c=center(); for(let i=0;i<n;i++){ state.metaballs.push({ x:c.x+(Math.random()-0.5)*120, y:c.y+(Math.random()-0.5)*120, vx:0, vy:0, r: 30+Math.random()*22 }); }
+      }
+      const c=center(); const G = 0.12 + env*0.85; // attraction to center by RMS
+      const mainY = c.y + lerp(-120,120, clamp((state.feat.pitch-80)/(320-80),0,1)); // pitch -> vertical
+      // update
+      for(const b of state.metaballs){
+        const tx=c.x, ty= b===state.metaballs[0]? mainY : c.y;
+        b.vx += (tx-b.x)*G*0.002; b.vy += (ty-b.y)*G*0.002; b.vx *= 0.96; b.vy *= 0.96; b.x += b.vx; b.y += b.vy;
+      }
+      // spawn tiny bubbles by flatness
+      const spawn = Math.min(12, Math.floor(3 + flat*12));
+      for(let i=0;i<spawn;i++){ const angle=Math.random()*Math.PI*2; const rr= 80+Math.random()*140; state.metaballs.push({ x:c.x+Math.cos(angle)*rr, y:c.y+Math.sin(angle)*rr, vx:0, vy:0, r: 4+Math.random()*4, life: 40+Math.random()*40 }); }
+      // decay small bubbles
+      state.metaballs = state.metaballs.filter(b=>{ if(b.life!=null){ b.life--; b.r*=0.99; return b.life>0; } return true; });
+
+      // draw (approximate merging via lighter)
+      ctx.save(); ctx.globalCompositeOperation='lighter';
+      for(const b of state.metaballs){ const g=ctx.createRadialGradient(b.x,b.y, b.r*0.2, b.x,b.y, b.r);
+        g.addColorStop(0, `hsla(${hue},70%,60%,${0.55+0.3*env})`);
+        g.addColorStop(1, `hsla(${(hue+80)%360},50%,10%,0)`);
+        ctx.fillStyle=g; circle(b.x,b.y, b.r); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // ====== Viz: Radial Beams ======
+    function drawBeams(hue, env, centroid, flat, pitch, tempo){
+      const c=center(); const groups = 24; // cluster bands
+      const t=(performance.now()-state.t0)/1000; state.hueShift = (state.hueShift + (0.4 + clamp((pitch-80)/(320-80),0,1))*0.6) % 360; // precession
+      const baseAng = t*0.3 + state.hueShift*0.002;
+
+      // derive grouped magnitudes from analyser bins
+      const mags = groupSpectrum(groups);
+      ctx.save(); ctx.globalCompositeOperation='screen';
+      for(let i=0;i<groups;i++){
+        const a = baseAng + i*(Math.PI*2/groups);
+        const len = (60 + mags[i]*1.2) * (1 + env*2.6);
+        const pulse = 1 + 0.12*Math.sin(t*10* Math.max(1,tempo));
+        const x2 = c.x + Math.cos(a)*len*pulse, y2 = c.y + Math.sin(a)*len*pulse;
+        ctx.strokeStyle = `hsla(${(hue+i*6)%360}, 80%, ${55+25*env}%, ${0.35+0.4*env})`;
+        ctx.lineWidth = 1 + mags[i]*0.02 + env*2.5;
+        ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(x2,y2); ctx.stroke();
+      }
+      // soft corona
+      const g=ctx.createRadialGradient(c.x,c.y, 8, c.x,c.y, 120+env*180); g.addColorStop(0,`hsla(${hue},70%,65%,${0.25+0.25*env})`); g.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=g; circle(c.x,c.y, 120+env*180); ctx.fill();
+      ctx.restore();
+    }
+    function groupSpectrum(groups){
+      // reuse fd magnitudes (0..255). If analyser not live, synth mags.
+      if(!(state.isLive&&state.analyser)) return new Array(groups).fill(20);
+      const spec = new Uint8Array(state.analyser.frequencyBinCount); state.analyser.getByteFrequencyData(spec);
+      const size = Math.floor(spec.length/groups); const mags=[]; for(let g=0; g<groups; g++){ let sum=0; for(let i=0;i<size;i++) sum+=spec[g*size+i]; mags.push(sum/size); } return mags;
+    }
+
+    // ====== Viz: Crystal Star ======
+    function drawStar(hue, env, flat, rough, pitch){
+      const c=center(); const facets = 7; const baseR = Math.min(state.w,state.h)*0.11*(1+env*0.8);
+      const pts=[]; const t=(performance.now()-state.t0)/1000;
+      for(let i=0;i<facets;i++){
+        const a=i*(Math.PI*2/facets); const jitter= (0.15+env*0.35)*noise2(i*1.3, t*0.7);
+        const r = baseR*(1 + jitter);
+        pts.push({x:c.x+Math.cos(a)*r, y:c.y+Math.sin(a)*r});
+      }
+      const disp = clamp((pitch-80)/(320-80),0,1); // dispersion -> rainbow edge
+      // fill body
+      const g=ctx.createLinearGradient(pts[0].x,pts[0].y, c.x,c.y);
+      g.addColorStop(0, `hsla(${(hue+disp*60)%360}, 70%, ${40+30*env}%, ${0.35 + 0.3*(1-rough)})`);
+      g.addColorStop(1, `hsla(${(hue+180+disp*40)%360}, 50%, ${20+20*env}%, ${0.25 + 0.2*(1-rough)})`);
+      ctx.save(); ctx.globalCompositeOperation='screen'; ctx.fillStyle=g; poly(pts); ctx.fill();
+      // facets lines (sharpness by flatness)
+      const sharp = 0.6 + (1-flat)*1.2; ctx.lineWidth = 0.6 + sharp*1.6; ctx.strokeStyle = `hsla(${(hue+80)%360},85%,${80+10*env}%,${0.35+0.35*sharp})`;
+      ctx.stroke(); ctx.restore();
+    }
+    function poly(pts){ ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y); for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x,pts[i].y); ctx.closePath(); }
+
+    // ====== primitives ======
+    function circle(x,y,r){ ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); }
+
+    // Auto tidy
+    addEventListener('pagehide', stopMic);
+  </script>
+</body>
+</html>
